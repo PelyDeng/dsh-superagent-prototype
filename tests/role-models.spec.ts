@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import { agentEvents, installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { agentEvents, type Agent, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { initializeRoleModel } from '../src/app/role-models.ts'
@@ -15,11 +15,24 @@ async function fixture() {
   ctx.reflect.provide('sessionPersistence', { flush })
   const session = Session.create(SessionId('role-model'))
   const agent = { ctx, session } as Agent
-  const host: ModelSelectionRef = { get current() { return session.requestHeader()?.config ?? { provider: 'host', model: 'default', reasoningEffort: ReasoningEffortId('high') } }, assembled: undefined }
-  installModelSelection(ctx, host)
+  // rc.5 removed installModelSelection(ctx, host) and the ModelSelectionRef surface (selection
+  // moved into the host-side projection/AgentModel). Replicate the old wiring locally so the
+  // fixture keeps exercising initializeRoleModel against the same resolution semantics:
+  // agent/request resolves from the request header, then the latest recorded model/selection,
+  // then the host default.
+  const hostDefault = { provider: 'host', model: 'default', reasoningEffort: ReasoningEffortId('high') }
+  let selection: ModelSelection | undefined
+  ctx.on('session/event', (s, event) => {
+    if (s === session && (event as { type?: string }).type === 'model/selection') selection = (event as { data?: unknown }).data as ModelSelection
+  })
+  ctx.on('agent/request', async (_payload, next) => {
+    const result = await next() as unknown as Record<string, unknown>
+    const current = session.requestHeader()?.config ?? selection ?? hostDefault
+    return { ...result, ...current }
+  })
   const request = () => agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ provider: 'seed', model: 'seed' }))
-  const record = (selection: ModelSelection) => { const event = session.append('request/header', { header: { config: selection }, reason: 'initial' }); ctx.emit('session/event', session, event) }
-  return { ctx, agent, host, resolve, flush, request, record }
+  const record = (value: ModelSelection) => { const event = session.append('request/header', { header: { config: value }, reason: 'initial' }); ctx.emit('session/event', session, event) }
+  return { ctx, agent, resolve, flush, request, record }
 }
 it('keeps prompt variables and initial routing on the role model without saving the host default', async () => {
   const { ctx, agent, request, record, flush } = await fixture()
@@ -36,11 +49,10 @@ it('keeps prompt variables and initial routing on the role model without saving 
   expect(await request()).toEqual(selected)
 })
 it('lets a later explicit selection win without changing the in-flight assembled step', async () => {
-  const { ctx, agent, host, request } = await fixture()
+  const { ctx, agent, request } = await fixture()
   await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'one' })
   await ctx.systemPrompt.assemble()
   const manual = { provider: 'manual', model: 'two', reasoningEffort: ReasoningEffortId('low') }
-  Object.defineProperty(host, 'current', { value: manual, configurable: true })
   const event = agent.session.append('model/selection', manual); ctx.emit('session/event', agent.session, event)
   expect(await request()).toEqual({ provider: 'worker', model: 'one' })
   await ctx.systemPrompt.assemble()

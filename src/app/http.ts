@@ -230,11 +230,12 @@ function match(table: Routes, method: string, segments: string[]) {
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
   if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
   const table = routes(runtime)
-  const disposers = [
-    ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
+  const orchestratorHandler = async (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      // rc.5 起 webserver.port 可为 undefined(动态分配,监听前未知);拿不到端口就无法
+      // 校验同源 Host 头,按防失效原则直接拒绝(传 -1 永不匹配 127.0.0.1:<port>)。
+      if (!sameOrigin(req, ctx.webServer.port ?? -1)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
@@ -242,6 +243,13 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
       } catch (error) { json(res, ...failure(error)) }
-    } })]
+    }
+  // 宿主 master 起 WebRoute.auth 默认 required,无 peer 授权提供者的组合会把面板/执行器
+  // 直接挡在 503;本路由的准入一直由 sameOrigin(Host 头 + 自定义头 + Origin 校验)自管,
+  // 因此显式放开宿主层。auth 字段经非字面量变量传递(npm rc.5 类型尚未含该字段)。
+  const orchestratorRoute = { kind: 'prefix' as const, path: '/orchestrator', auth: 'anonymous' as const, handler: orchestratorHandler }
+  const disposers = [
+    ctx.webServer.register(orchestratorRoute),
+  ]
   return () => { for (const dispose of disposers) dispose() }
 }

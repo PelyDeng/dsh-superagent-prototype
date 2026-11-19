@@ -111,8 +111,23 @@ async function sourcePage(read: Read, source: string, fetch: () => Promise<unkno
 const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
   preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}` })
-async function transcript(host: ResourceHost, ticketId: string) {
-  return (await host.context.sessionController.inspect(workerSessionId(ticketId) as SessionId)).events
+export async function transcript(host: ResourceHost, ticketId: string) {
+  // rc.5 起 SessionController.inspect(id) 被 events(SessionPageRequest, signal) 取代:
+  // 返回有限预算的分页,这里向后翻页读完整份工作会话日志,再按 seq 恢复时间序。
+  // 翻页游标必须取本页最旧记录的 seq(records 升序,records[0]);page.cursor 是读取时
+  // 的日志上界(throughSeq ?? observation.cursor),拿它当 beforeSeq 会在第 3 页起原地打转。
+  const controller = host.context.sessionController
+  const address = { kind: 'session', sessionId: workerSessionId(ticketId) as SessionId } as const
+  const records: { event: { type: string; seq: number } }[] = []
+  let beforeSeq: number | undefined
+  for (;;) {
+    const page = await controller.events({ address, beforeSeq, maxMessages: 200 }, new AbortController().signal)
+    const batch = page.records as unknown as { event: { type: string; seq: number } }[]
+    records.push(...batch)
+    if (!page.hasMore || batch.length === 0) break
+    beforeSeq = batch[0]!.event.seq
+  }
+  return records.map(record => record.event).sort((a, b) => a.seq - b.seq) as unknown as import('@deepseek-ai/dsh-session').SessionEvent[]
 }
 
 const ROUTES: readonly Route[] = [
